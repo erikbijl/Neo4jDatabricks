@@ -23,7 +23,6 @@ from pyspark.sql import functions as F
 
 # COMMAND ----------
 
-uri = "neo4j+s://29a95706.databases.neo4j.io:7687"
 user = "neo4j"
 database = "neo4j"
 
@@ -31,6 +30,7 @@ database = "neo4j"
 
 username = dbutils.secrets.get(scope="kv_db", key="neo4jUsername")
 password = dbutils.secrets.get(scope="kv_db", key="neo4jPassword")
+uri = dbutils.secrets.get(scope="kv_db", key="neo4jUri")
 
 # COMMAND ----------
 
@@ -122,7 +122,7 @@ airports_df.display()
     .mode("Overwrite")
     .option("url", uri)
     .option("authentication.type", "basic")
-    .option("authentication.basic.username", user)
+    .option("authentication.basic.username", username)
     .option("authentication.basic.password", password)
     .option("database", database)
     .option("labels", ":Airports")
