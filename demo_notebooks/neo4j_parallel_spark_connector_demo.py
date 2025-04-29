@@ -14,10 +14,13 @@
 # COMMAND ----------
 
 from neo4j import GraphDatabase
+from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 from neo4j_parallel_spark_loader.bipartite import group_and_batch_spark_dataframe
 from neo4j_parallel_spark_loader import ingest_spark_dataframe
 from neo4j_parallel_spark_loader.visualize import create_ingest_heatmap
+import time
+import os
 
 # COMMAND ----------
 
@@ -30,14 +33,28 @@ from neo4j_parallel_spark_loader.visualize import create_ingest_heatmap
 
 # COMMAND ----------
 
-user = "neo4j"
-database = "neo4j"
+os.environ['NEO4J_DATABASE'] = "neo4j"
+os.environ['NEO4J_USERNAME'] = dbutils.secrets.get(scope="kv_db", key="neo4jUsername")
+os.environ['NEO4J_PASSWORD'] = dbutils.secrets.get(scope="kv_db", key="neo4jPassword")
+os.environ['NEO4J_URI'] = dbutils.secrets.get(scope="kv_db", key="neo4jUri")
 
 # COMMAND ----------
 
-username = dbutils.secrets.get(scope="kv_db", key="neo4jUsername")
-password = dbutils.secrets.get(scope="kv_db", key="neo4jPassword")
-uri = dbutils.secrets.get(scope="kv_db", key="neo4jUri")
+# MAGIC %md
+# MAGIC ## Create Spark Session
+
+# COMMAND ----------
+
+spark = (
+    SparkSession.builder
+    .appName("LoadFlights")
+    .config("neo4j.url", os.environ.get("NEO4J_URI"))
+    .config("url", os.environ.get("NEO4J_URI"))
+    .config("neo4j.authentication.basic.username", os.environ.get("NEO4J_USERNAME"))
+    .config("neo4j.authentication.basic.password", os.environ.get("NEO4J_PASSWORD"))
+    .config("neo4j.database", os.environ.get("NEO4J_DATABASE"))
+    .getOrCreate()
+)
 
 # COMMAND ----------
 
@@ -127,11 +144,6 @@ airports_df.display()
     .write
     .format("org.neo4j.spark.DataSource")
     .mode("Overwrite")
-    .option("url", uri)
-    .option("authentication.type", "basic")
-    .option("authentication.basic.username", username)
-    .option("authentication.basic.password", password)
-    .option("database", database)
     .option("labels", ":Airports")
     .option("node.keys", "name")
     .save()
@@ -170,11 +182,6 @@ flights_df.display()
     .write
     .format("org.neo4j.spark.DataSource")
     .mode("Append")
-    .option("url", uri)
-    .option("authentication.type", "basic")
-    .option("authentication.basic.username", user)
-    .option("authentication.basic.password", password)
-    .option("database", database)
     .option("labels", ":Flights")
     .option("node.keys", "key")
     .save()
@@ -204,11 +211,17 @@ class App:
         (key, value) = result.records[0].items()[0]
         return value
 
-    def remove_nodes_relationships(self):
-        query = "MATCH (n) DETACH DELETE n"
+    def remove_nodes(self):
+        query ="""
+            CALL apoc.periodic.iterate(
+                "MATCH (c) RETURN c",
+                "WITH c DELETE c",
+                {batchSize: 1000}
+            )
+        """
         result = self.query(query)
 
-    def remove_nodes_relationships(self):
+    def remove_relationships(self):
         query ="""
             CALL apoc.periodic.iterate(
                 "MATCH ()-[c]-() RETURN c",
@@ -217,10 +230,20 @@ class App:
             )
         """
         result = self.query(query)
+    
+    def remove_nodes_relationships(self):
+        query ="""
+            CALL apoc.periodic.iterate(
+                "MATCH (c) RETURN c",
+                "WITH c DETACH DELETE c",
+                {batchSize: 1000}
+            )
+        """
+        result = self.query(query)
 
 # COMMAND ----------
 
-app = App(uri, username, password, database)
+app = App(os.environ.get("NEO4J_URI"), os.environ.get("NEO4J_USERNAME"), os.environ.get("NEO4J_PASSWORD"), os.environ.get("NEO4J_DATABASE"))
 
 # COMMAND ----------
 
@@ -240,7 +263,7 @@ app.query(query)
 # COMMAND ----------
 
 # MAGIC %md 
-# MAGIC ## Write Relations (:Flights)-[:FROM]->(:Airports)
+# MAGIC ## Write Relations Serially
 
 # COMMAND ----------
 
@@ -249,12 +272,19 @@ app.query(query)
 # COMMAND ----------
 
 flights_from_df = (    
-    flights_df
+    flights_df.union(flights_df).union(flights_df)
     .select('key', 'origin_airport')
     .withColumnRenamed('origin_airport', 'target.name')
     .withColumn('source.key', F.col('key'))
     .drop('key')
 )
+
+# COMMAND ----------
+
+flights_from_df.count()
+
+# COMMAND ----------
+
 flights_from_df.display()
 
 # COMMAND ----------
@@ -263,147 +293,55 @@ flights_from_df.display()
 
 # COMMAND ----------
 
-# flights_from_df = flights_from_df.repartition(1)
-# (
-#     flights_from_df
-#     .write
-#     .format("org.neo4j.spark.DataSource")
-#     .mode("overwrite")
-#     .option("url", uri)
-#     .option("authentication.type", "basic")
-#     .option("authentication.basic.username", user)
-#     .option("authentication.basic.password", password)
-#     .option("database", database)
-#     .option("relationship", "FROM")
-#     .option("relationship.source.labels", ":Flights")
-#     .option("relationship.source.save.mode", "overwrite")
-#     .option("relationship.source.node.keys", "source.key:key")
-#     .option("relationship.target.labels", ":Airports")
-#     .option("relationship.target.save.mode", "overwrite")
-#     .option("relationship.target.node.keys", "target.name:name")
-#     .save()
-# )
+t1 = time.time()
 
 # COMMAND ----------
 
-# MAGIC %md 
-# MAGIC ## Write Relations (:Flights)-[:TO]->(:Airports)
-
-# COMMAND ----------
-
-# MAGIC %md Now select flights and their destination airport. Again, relations require a source.[PROP] and target.[PROP] indicating from which node/column to which node/column the relation must be connected. 
-
-# COMMAND ----------
-
-flights_to_df = (    
-    flights_df
-    .select('key', 'destination_airport')
-    .withColumnRenamed('destination_airport', 'target.name')
-    .withColumn('source.key', F.col('key'))
-    .drop('key')
-)
-flights_to_df.display()
-
-# COMMAND ----------
-
-# MAGIC %md Write the TO relations to the database using the SparkConnector
-
-# COMMAND ----------
-
-# flights_to_df = flights_to_df.repartition(1)
-# (
-#     flights_to_df
-#     .write
-#     .format("org.neo4j.spark.DataSource")
-#     .mode("overwrite")
-#     .option("url", uri)
-#     .option("authentication.type", "basic")
-#     .option("authentication.basic.username", user)
-#     .option("authentication.basic.password", password)
-#     .option("database", database)
-#     .option("relationship", "TO")
-#     .option("relationship.source.labels", ":Flights")
-#     .option("relationship.source.save.mode", "overwrite")
-#     .option("relationship.source.node.keys", "source.key:key")
-#     .option("relationship.target.labels", ":Airports")
-#     .option("relationship.target.save.mode", "overwrite")
-#     .option("relationship.target.node.keys", "target.name:name")
-#     .save()
-# )
-
-# COMMAND ----------
-
-# MAGIC %md 
-# MAGIC ## Read from Database
-
-# COMMAND ----------
-
-# MAGIC %md Read the Flight nodes from the database
-
-# COMMAND ----------
-
-flights_nodes_df = (
-    spark.read.format("org.neo4j.spark.DataSource")
-    .option("url", uri)
-    .option("authentication.type", "basic")
-    .option("authentication.basic.username", user)
-    .option("authentication.basic.password", password)
-    .option("database", database)
-    .option("labels", "Flights")
-    .load()
-)
-
-# COMMAND ----------
-
-flights_nodes_df.display()
-
-# COMMAND ----------
-
-# MAGIC %md Read the FROM relations from the databbase
-
-# COMMAND ----------
-
-from_relations_df = (
-    spark.read.format("org.neo4j.spark.DataSource")
-    .option("url", uri)
-    .option("authentication.type", "basic")
-    .option("authentication.basic.username", user)
-    .option("authentication.basic.password", password)
-    .option("database", database)
+(
+    flights_from_df.repartition(1)
+    .write
+    .format("org.neo4j.spark.DataSource")
+    .mode("overwrite")
     .option("relationship", "FROM")
-    .option("relationship.source.labels", "Flights")
-    .option("relationship.target.labels", "Airports")
-    .load()
+    .option("relationship.source.labels", ":Flights")
+    .option("relationship.source.save.mode", "overwrite")
+    .option("relationship.source.node.keys", "source.key:key")
+    .option("relationship.target.labels", ":Airports")
+    .option("relationship.target.save.mode", "overwrite")
+    .option("relationship.target.node.keys", "target.name:name")
+    .save()
 )
 
 # COMMAND ----------
 
-from_relations_df.display()
+t2 = time.time()
+load_serial_time = t2-t1
+load_serial_time
+
+# COMMAND ----------
+
+app.query("MATCH p=()-[:FROM]->() RETURN COUNT(p)")
+
+# COMMAND ----------
+
+app.remove_relationships()
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC # Parallel Load
+# MAGIC ## Write Relations in Parallel
 
 # COMMAND ----------
 
-app.remove_nodes_relationships()
-
-# COMMAND ----------
-
-spark_executor_count = 4
-
-# COMMAND ----------
-
-flights_from_df
-
-# COMMAND ----------
-
-flights_from_df.count()
+spark_executor_count=5
 
 # COMMAND ----------
 
 flights_from_df = flights_from_df.withColumnRenamed("source.key", "key").withColumnRenamed("target.name", "name")
+
+# COMMAND ----------
+
+t3 = time.time()
 
 # COMMAND ----------
 
@@ -431,19 +369,35 @@ query = """
 ingest_spark_dataframe(
     spark_dataframe=rel_batch_df,
     save_mode= "Overwrite",
-    options={"query":query, "url": uri, "authentication.type": "basic", "authentication.basic.username": user, "authentication.basic.password": password, "database": database}
+    options={
+        "query":query, 
+        "relationship.source.labels": "Flights", 
+        "relationship.source.save.mode": "overwrite",
+        "relationship.source.node.keys": "source.key:key",
+        "relationship.target.labels": ":Airports",
+        "relationship.target.save.mode": "overwrite",
+        "relationship.target.node.keys": "target.name:name"
+    },
+    num_groups = spark_executor_count
 )
+
+# COMMAND ----------
+
+t4 = time.time()
+load_parallel_time = t4-t3
+
+# COMMAND ----------
+
+load_parallel_time
+
+# COMMAND ----------
+
+app.query("MATCH p=()-[:FROM]->() RETURN COUNT(p)")
+
+# COMMAND ----------
+
+app.remove_relationships()
 
 # COMMAND ----------
 
 app.remove_nodes_relationships()
-
-# COMMAND ----------
-
-(
-    flights_from_df.repartition(1).write
-    .format("org.neo4j.spark.DataSource")
-    .mode("Overwrite")
-    .option("query", query)
-    .save()
-)
