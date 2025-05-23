@@ -13,7 +13,7 @@
 
 # COMMAND ----------
 
-from neo4j import GraphDatabase
+from neo4j import Query, GraphDatabase, RoutingControl, Result
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 from neo4j_parallel_spark_loader.bipartite import group_and_batch_spark_dataframe
@@ -34,9 +34,9 @@ import os
 # COMMAND ----------
 
 os.environ['NEO4J_DATABASE'] = "neo4j"
-os.environ['NEO4J_USERNAME'] = dbutils.secrets.get(scope="kv_db", key="neo4jUsername")
-os.environ['NEO4J_PASSWORD'] = dbutils.secrets.get(scope="kv_db", key="neo4jPassword")
-os.environ['NEO4J_URI'] = dbutils.secrets.get(scope="kv_db", key="neo4jUri")
+os.environ['NEO4J_USERNAME'] = dbutils.secrets.get(scope="key-vault-scope", key="neo4jUsername")
+os.environ['NEO4J_PASSWORD'] = dbutils.secrets.get(scope="key-vault-scope", key="neo4jPassword")
+os.environ['NEO4J_URI'] = dbutils.secrets.get(scope="key-vault-scope", key="neo4jUri")
 
 # COMMAND ----------
 
@@ -44,6 +44,7 @@ os.environ['NEO4J_URI'] = dbutils.secrets.get(scope="kv_db", key="neo4jUri")
 # MAGIC ## Create Spark Session
 
 # COMMAND ----------
+
 
 spark = (
     SparkSession.builder
@@ -67,8 +68,8 @@ spark = (
 
 # COMMAND ----------
 
-storage_account_name =  dbutils.secrets.get(scope="kv_db", key="saName")
-storage_account_access_key =  dbutils.secrets.get(scope="kv_db", key="saKeyAccess")
+storage_account_name =  dbutils.secrets.get(scope="key-vault-scope", key="saName")
+storage_account_access_key =  dbutils.secrets.get(scope="key-vault-scope", key="saKeyAccess")
 
 # COMMAND ----------
 
@@ -143,7 +144,7 @@ airports_df.display()
     airports_df
     .write
     .format("org.neo4j.spark.DataSource")
-    .mode("Overwrite")
+    .mode("Append")
     .option("labels", ":Airports")
     .option("node.keys", "name")
     .save()
@@ -194,71 +195,104 @@ flights_df.display()
 
 # COMMAND ----------
 
-class App:
-    def __init__(self, uri, user, password, database=None):
-        self.driver = GraphDatabase.driver(uri, auth=(user, password), database=database)
-        self.database = database
+driver = GraphDatabase.driver(
+    os.environ.get("NEO4J_URI"),
+    auth=(os.environ.get("NEO4J_USERNAME"), os.environ.get("NEO4J_PASSWORD"))
+)
 
-    def close(self):
-        self.driver.close()
+# COMMAND ----------
 
-    def query(self, query):
-        return self.driver.execute_query(query)
-        
-    def count_nodes_in_db(self):
-        query = "MATCH (n) RETURN COUNT(n)"
-        result = self.query(query)
-        (key, value) = result.records[0].items()[0]
-        return value
 
-    def remove_nodes(self):
-        query ="""
-            CALL apoc.periodic.iterate(
-                "MATCH (c) RETURN c",
-                "WITH c DELETE c",
-                {batchSize: 1000}
-            )
+
+# COMMAND ----------
+
+def count_rel_in_db():
+    return driver.execute_query(
         """
-        result = self.query(query)
+        MATCH ()-[r]->()
+        RETURN COUNT(r) as rel_count
+        """,
+        database_=os.environ.get("NEO4J_DATABASE"),
+        routing_=RoutingControl.WRITE,
+        result_transformer_= lambda r: r.to_df()
+    ).iloc[0]['rel_count']
 
-    def remove_relationships(self):
-        query ="""
-            CALL apoc.periodic.iterate(
-                "MATCH ()-[c]-() RETURN c",
-                "WITH c DELETE c",
-                {batchSize: 1000}
+def remove_relations():
+    while (count_rel_in_db() > 0):
+        with driver.session() as session:
+            session.run("""
+            MATCH ()-[r]->()
+            WITH r LIMIT 10000
+            DELETE r
+            """
             )
+
+# COMMAND ----------
+
+def count_nodes_in_db():
+    return driver.execute_query(
         """
-        result = self.query(query)
-    
-    def remove_nodes_relationships(self):
-        query ="""
-            CALL apoc.periodic.iterate(
-                "MATCH (c) RETURN c",
-                "WITH c DETACH DELETE c",
-                {batchSize: 1000}
+        MATCH (n)
+        RETURN COUNT(n) as node_count
+        """,
+        database_=os.environ.get("NEO4J_DATABASE"),
+        routing_=RoutingControl.WRITE,
+        result_transformer_= lambda r: r.to_df()
+    ).iloc[0]['node_count']
+
+def remove_nodes():
+    while (count_nodes_in_db() > 0):
+        with driver.session() as session:
+            session.run("""
+            MATCH (n)
+            WITH n LIMIT 10000
+            DELETE n
+            """
             )
-        """
-        result = self.query(query)
 
 # COMMAND ----------
 
-app = App(os.environ.get("NEO4J_URI"), os.environ.get("NEO4J_USERNAME"), os.environ.get("NEO4J_PASSWORD"), os.environ.get("NEO4J_DATABASE"))
+driver.execute_query(
+    """
+    MATCH (n) RETURN COUNT(n) as Count
+    """,
+    database_=os.environ.get("NEO4J_DATABASE"),
+    routing_=RoutingControl.READ,
+    result_transformer_= lambda r: r.to_df()
+)
 
 # COMMAND ----------
 
-app.count_nodes_in_db()
+driver.execute_query(
+    """
+    CREATE CONSTRAINT unique_flights IF NOT EXISTS FOR (f:Flights) REQUIRE f.key IS UNIQUE
+    """,
+    database_=os.environ.get("NEO4J_DATABASE"),
+    routing_=RoutingControl.WRITE,
+    result_transformer_= lambda r: r.to_df()
+)
 
 # COMMAND ----------
 
-query = "CREATE CONSTRAINT unique_flights IF NOT EXISTS FOR (f:Flights) REQUIRE f.key IS UNIQUE"
-app.query(query)
-
+driver.execute_query(
+    """
+    CREATE CONSTRAINT unique_airports IF NOT EXISTS FOR (a:Airports) REQUIRE a.name IS UNIQUE
+    """,
+    database_=os.environ.get("NEO4J_DATABASE"),
+    routing_=RoutingControl.WRITE,
+    result_transformer_= lambda r: r.to_df()
+)
 
 # COMMAND ----------
 
-query = "CREATE CONSTRAINT unique_airports IF NOT EXISTS FOR (a:Airports) REQUIRE a.name IS UNIQUE"
-app.query(query)
+driver.execute_query(
+    """
+    SHOW CONSTRAINTS
+    """,
+    database_=os.environ.get("NEO4J_DATABASE"),
+    routing_=RoutingControl.READ,
+    result_transformer_= lambda r: r.to_df()
+)
 
 # COMMAND ----------
 
@@ -297,17 +331,42 @@ t1 = time.time()
 
 # COMMAND ----------
 
+# MAGIC %md
+# MAGIC #### Overwrite vs Append
+
+# COMMAND ----------
+
+
+
+# (
+#     flights_from_df.repartition(1)
+#     .write
+#     .format("org.neo4j.spark.DataSource")
+#     .mode("overwrite")
+#     .option("relationship", "FROM")
+#     .option("relationship.source.labels", ":Flights")
+#     .option("relationship.source.save.mode", "overwrite")
+#     .option("relationship.source.node.keys", "source.key:key")
+#     .option("relationship.target.labels", ":Airports")
+#     .option("relationship.target.save.mode", "overwrite")
+#     .option("relationship.target.node.keys", "target.name:name")
+#     .save()
+# )
+
+# COMMAND ----------
+
+
 (
     flights_from_df.repartition(1)
     .write
     .format("org.neo4j.spark.DataSource")
-    .mode("overwrite")
+    .mode("Append")
     .option("relationship", "FROM")
     .option("relationship.source.labels", ":Flights")
-    .option("relationship.source.save.mode", "overwrite")
+    .option("relationship.source.save.mode", "Match")
     .option("relationship.source.node.keys", "source.key:key")
     .option("relationship.target.labels", ":Airports")
-    .option("relationship.target.save.mode", "overwrite")
+    .option("relationship.target.save.mode", "Match")
     .option("relationship.target.node.keys", "target.name:name")
     .save()
 )
@@ -320,11 +379,15 @@ load_serial_time
 
 # COMMAND ----------
 
-app.query("MATCH p=()-[:FROM]->() RETURN COUNT(p)")
+count_nodes_in_db()
 
 # COMMAND ----------
 
-app.remove_relationships()
+count_rel_in_db()
+
+# COMMAND ----------
+
+remove_relations()
 
 # COMMAND ----------
 
@@ -360,22 +423,50 @@ create_ingest_heatmap(rel_batch_df)
 
 # COMMAND ----------
 
+# MAGIC %md
+# MAGIC #### Overwrite vs Append
+
+# COMMAND ----------
+
+# query = """
+#     MATCH (source:Flights {key: event.key})
+#     MATCH (target:Airports {name: event.name})
+#     MERGE (source)-[r:FROM]->(target)
+#     """
+
+# ingest_spark_dataframe(
+#     spark_dataframe=rel_batch_df,
+#     save_mode= "Overwrite",
+#     options={
+#         "query":query, 
+#         "relationship.source.labels": "Flights", 
+#         "relationship.source.save.mode": "overwrite",
+#         "relationship.source.node.keys": "source.key:key",
+#         "relationship.target.labels": ":Airports",
+#         "relationship.target.save.mode": "overwrite",
+#         "relationship.target.node.keys": "target.name:name"
+#     },
+#     num_groups = spark_executor_count
+# )
+
+# COMMAND ----------
+
 query = """
     MATCH (source:Flights {key: event.key})
     MATCH (target:Airports {name: event.name})
-    MERGE (source)-[r:FROM]->(target)
+    CREATE (source)-[r:FROM]->(target)
     """
 
 ingest_spark_dataframe(
     spark_dataframe=rel_batch_df,
-    save_mode= "Overwrite",
+    save_mode= "Append",
     options={
         "query":query, 
         "relationship.source.labels": "Flights", 
-        "relationship.source.save.mode": "overwrite",
+        "relationship.source.save.mode": "Match",
         "relationship.source.node.keys": "source.key:key",
         "relationship.target.labels": ":Airports",
-        "relationship.target.save.mode": "overwrite",
+        "relationship.target.save.mode": "Match",
         "relationship.target.node.keys": "target.name:name"
     },
     num_groups = spark_executor_count
@@ -392,12 +483,16 @@ load_parallel_time
 
 # COMMAND ----------
 
-app.query("MATCH p=()-[:FROM]->() RETURN COUNT(p)")
+count_nodes_in_db()
 
 # COMMAND ----------
 
-app.remove_relationships()
+count_rel_in_db()
 
 # COMMAND ----------
 
-app.remove_nodes_relationships()
+remove_relations()
+
+# COMMAND ----------
+
+remove_nodes()
